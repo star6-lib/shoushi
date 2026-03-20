@@ -1,0 +1,25 @@
+model:
+  fc_dim: 256
+  N_layer: 3
+  n_head: 1
+
+train:
+  epochs: 200
+  coor_sampling_size: 500
+  batchsize: 10
+  coor_sampling_freq: 3
+  base_lr: 0.001
+  visual_freq: 2
+  weight_load: 100
+  weight_pde: 1
+  weight_fix: 100
+  weight_free: 10
+  weight_ce: 1
+
+  # learning rate decay settings
+  lr_decay_type: 'step'  # 'step', 'exp', 'cosine', 'plateau'
+  lr_decay_step: 50      # for step decay: decay every N epochs
+  lr_decay_rate: 0.5    # for step decay: multiply lr by this factor
+  lr_decay_gamma: 0.95  # for exponential decay: multiply lr by gamma each epoch
+  lr_min: 1e-6          # minimum learning rate
+  lr_patience: 10       # for plateau: epochs to wait before reducing lr
