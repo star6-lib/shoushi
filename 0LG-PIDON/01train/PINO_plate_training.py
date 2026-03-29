@@ -3,7 +3,7 @@ import argparse
 import yaml
 
 from lib.model_plate import GANO
-from lib.utils_plate_train import train, sup_train
+from lib.utils_plate_train import train, sup_train, plus_train
 from lib.utils_data import generate_plate_stress_data_loader
 
 import os
@@ -50,7 +50,9 @@ if __name__ == '__main__':
     elif args.phase == 'sup_train':
         print("\n>>> 启动 [纯数据驱动 Data-Driven] 训练模式...\n")
         sup_train(args, config, model, device, (train_loader, val_loader, test_loader), num_nodes_list, params)
-
+    elif args.phase == 'plus_train':
+        print("\n>>> 启动 [物理-数据双驱动 Dual-Driven] 训练模式...\n")
+        plus_train(args, config, model, device, (train_loader, val_loader, test_loader), num_nodes_list, params)
     else:
         print("\n>>> 未知模式，请检查 --phase 参数设定！")
 

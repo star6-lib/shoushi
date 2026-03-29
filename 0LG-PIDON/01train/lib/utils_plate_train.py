@@ -742,3 +742,294 @@ def sup_train(args, config, model, device, loaders, num_nodes_list, params):
     print(f" 🌟 Disp V (Y方向位移) Relative L2 Error: {err_v:.4f}")
     print(f" 🔥 Von Mises Stress   Relative L2 Error: {err_vm:.4f}")
     print("=================================================================\n")
+
+
+# ==========================================================
+# define the Physics-Informed + Data-Driven training function (双驱动)
+# ==========================================================
+
+def plus_train(args, config, model, device, loaders, num_nodes_list, params):
+    # print training configuration
+    print('================================')
+    print('Dual-Driven (Physics + Data) Training Configuration')
+    print('batchsize:', config['train']['batchsize'])
+    print('coordinate sampling frequency:', config['train']['coor_sampling_freq'])
+    print('learning rate:', config['train']['base_lr'])
+    print('================================')
+
+    # get train and test loader
+    train_loader, val_loader, test_loader = loaders
+
+    # get number of nodes of different type
+    max_pde_nodes, max_bcxy_nodes, max_bcy_nodes, max_par_nodes, max_hole_nodes = num_nodes_list
+
+    # define model training configuration
+    pbar = range(config['train']['epochs'])
+    pbar = tqdm(pbar, dynamic_ncols=True, smoothing=0.1)
+
+    # define optimizer and loss
+    mse = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=config['train']['base_lr'])
+
+    # visual frequency
+    vf = config['train']['visual_freq']
+
+    # err history
+    err_hist = []
+
+    # move the model to the defined device
+    try:
+        model.load_state_dict(
+            torch.load(r'./res/saved_models/best_model_{}_{}_{}.pkl'.format(args.geo_node, args.data, args.model),
+                       weights_only=True))
+        print('>>> 成功加载已有的最佳模型！(基于之前的预训练)')
+    except:
+        print('No trained models, starting from scratch')
+    model = model.to(device)
+
+    # start the training
+    if args.phase in ['train', 'sup_train', 'plus_train']:
+        min_val_err = np.inf
+
+        model.eval()
+        init_u, init_v, init_vm = val(model, val_loader, args, device, num_nodes_list)
+        print(f"\n[Epoch 0 / Init] Validation L2 Error | U: {init_u:.6f} | V: {init_v:.6f} | VM: {init_vm:.6f}\n")
+
+        # === 初始化 10 个 NTK 自适应权重 (5个数据 + 5个物理) ===
+        lam_u, lam_v, lam_sxx, lam_syy, lam_sxy = 1.0, 1.0, 1.0, 1.0, 1.0
+        lam_pde, lam_const, lam_load, lam_fix, lam_free = 1.0, 1.0, 1.0, 1.0, 1.0
+
+        alpha = 0.9  # 滑动平均衰减率 (EMA)
+        update_freq = 50  # 每 50 个 batch 更新一次权重
+
+        # 累加器初始化
+        avg_loss = {
+            'data_u': 0.0, 'data_v': 0.0, 'data_sxx': 0.0, 'data_syy': 0.0, 'data_sxy': 0.0,
+            'phys_pde': 0.0, 'phys_const': 0.0, 'phys_load': 0.0, 'phys_fix': 0.0, 'phys_free': 0.0,
+            'total': 0.0
+        }
+
+        for e in pbar:
+            model.train()
+
+            for batch_idx, (coors, u, v, sxx, syy, sxy, flag, geo, in_disp, in_force, f_type, vm) in enumerate(
+                    train_loader):
+
+                # =======================================================
+                # 准备全局数据 (Data-driven 需求)
+                # =======================================================
+                all_coors = coors.float().to(device)
+                all_flag = flag.float().to(device)
+                in_disp = in_disp.float().to(device)
+                in_force = in_force.float().to(device)
+                u_gt, v_gt = u.float().to(device), v.float().to(device)
+                sxx_gt, syy_gt, sxy_gt = sxx.float().to(device), syy.float().to(device), sxy.float().to(device)
+                f_type = f_type.float().to(device)
+                geo = geo.float().to(device)
+
+                # 解析几何编码掩码
+                if args.geo_node in ('vary_bound', 'vary_bound_sup'):
+                    ss_index_geo = np.arange(max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes,
+                                             max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes + max_hole_nodes)
+                if args.geo_node == 'all_bound':
+                    ss_index_geo = np.arange(max_pde_nodes,
+                                             max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes + max_hole_nodes)
+                if args.geo_node == 'all_domain':
+                    ss_index_geo = np.arange(0,
+                                             max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes + max_hole_nodes)
+
+                shape_coor = coors[:, ss_index_geo, :].float().to(device)
+                shape_flag = flag[:, ss_index_geo].float().to(device)
+
+                # =======================================================
+                # 模块 1: 数据驱动损失 (Data-Driven Losses) - 全场评估
+                # =======================================================
+                u_pred, v_pred, sxx_pred, syy_pred, sxy_pred = model(all_coors[:, :, 0], all_coors[:, :, 1], in_disp,
+                                                                     in_force, shape_coor, shape_flag)
+
+                loss_data_u = mse(u_pred * all_flag, u_gt * all_flag)
+                loss_data_v = mse(v_pred * all_flag, v_gt * all_flag)
+                loss_data_sxx = mse(sxx_pred * all_flag, sxx_gt * all_flag)
+                loss_data_syy = mse(syy_pred * all_flag, syy_gt * all_flag)
+                loss_data_sxy = mse(sxy_pred * all_flag, sxy_gt * all_flag)
+
+                # =======================================================
+                # 模块 2: 物理驱动损失 (Physics-Informed Losses) - 局部采样评估
+                # =======================================================
+
+                # PDE 采样与变量追踪
+                ss_idx_pde = torch.randint(0, max_pde_nodes, (config['train']['coor_sampling_size'],), device=device)
+                pde_sampled_coors = all_coors[:, ss_idx_pde, :]
+                pde_flag = all_flag[:, ss_idx_pde]
+
+                x_pde = Variable(pde_sampled_coors[:, :, 0], requires_grad=True)
+                y_pde = Variable(pde_sampled_coors[:, :, 1], requires_grad=True)
+                u_pde_pred, v_pde_pred, sxx_pde, syy_pde, sxy_pde = model(x_pde, y_pde, in_disp, in_force, shape_coor,
+                                                                          shape_flag)
+
+                rx, ry = plate_stress_loss(sxx_pde, syy_pde, sxy_pde, x_pde, y_pde)
+                diff_sxx, diff_syy, diff_sxy = constitutive_loss(u_pde_pred, v_pde_pred, sxx_pde, syy_pde, sxy_pde,
+                                                                 x_pde, y_pde, params)
+
+                loss_phys_pde = torch.mean((rx * pde_flag) ** 2) + torch.mean((ry * pde_flag) ** 2)
+                loss_phys_const = torch.mean((diff_sxx * pde_flag) ** 2) + torch.mean(
+                    (diff_syy * pde_flag) ** 2) + torch.mean((diff_sxy * pde_flag) ** 2)
+
+                # Top Edge (载荷边界)
+                mask_force = ((f_type == 1) | (f_type == 2)).float().unsqueeze(-1)
+                mask_disp = ((f_type == 3) | (f_type == 4)).float().unsqueeze(-1)
+                x_top = torch.linspace(-10, 10, 101).unsqueeze(0).repeat(in_disp.shape[0], 1).to(device)
+                y_top = torch.ones_like(x_top) * 10.0
+                u_top_pred, v_top_pred, _, syy_top, sxy_top = model(x_top, y_top, in_disp, in_force, shape_coor,
+                                                                    shape_flag)
+                sigma_yy_top, sigma_xy_top = bc_edgeY_loss(syy_top, sxy_top)
+
+                loss_load_force = mse(sigma_yy_top * mask_force, in_force * mask_force) + mse(sigma_xy_top * mask_force,
+                                                                                              torch.zeros_like(
+                                                                                                  sigma_xy_top))
+                loss_load_disp = mse(v_top_pred * mask_disp, in_disp * mask_disp) + mse(sigma_xy_top * mask_disp,
+                                                                                        torch.zeros_like(sigma_xy_top))
+                loss_phys_load = loss_load_force + loss_load_disp
+
+                # 侧边 BCxy (固定边界)
+                idx_bcxy = np.arange(max_pde_nodes + max_par_nodes + max_bcy_nodes,
+                                     max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes)
+                u_BCxy_pred, v_BCxy_pred, _, _, _ = model(all_coors[:, idx_bcxy, 0], all_coors[:, idx_bcxy, 1], in_disp,
+                                                          in_force, shape_coor, shape_flag)
+                loss_phys_fix = torch.mean((u_BCxy_pred * all_flag[:, idx_bcxy]) ** 2) + torch.mean(
+                    (v_BCxy_pred * all_flag[:, idx_bcxy]) ** 2)
+
+                # 侧边 BCy 与孔洞 Hole (自由边界)
+                idx_bcy = np.arange(max_pde_nodes + max_par_nodes, max_pde_nodes + max_par_nodes + max_bcy_nodes)
+                _, _, sxx_bcy, syy_bcy, sxy_bcy = model(all_coors[:, idx_bcy, 0], all_coors[:, idx_bcy, 1], in_disp,
+                                                        in_force, shape_coor, shape_flag)
+                sigma_xx, sigma_xy = bc_edgeX_loss(sxx_bcy, sxy_bcy)
+                free_bc = torch.mean((sigma_xx * all_flag[:, idx_bcy]) ** 2) + torch.mean(
+                    (sigma_xy * all_flag[:, idx_bcy]) ** 2)
+
+                idx_hole = np.arange(max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes,
+                                     max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes + max_hole_nodes)
+                _, _, sxx_hole, syy_hole, sxy_hole = model(all_coors[:, idx_hole, 0], all_coors[:, idx_hole, 1],
+                                                           in_disp, in_force, shape_coor, shape_flag)
+                Tx_hole, Ty_hole = hole_free_loss(sxx_hole, syy_hole, sxy_hole, all_coors[:, idx_hole, 0],
+                                                  all_coors[:, idx_hole, 1], geo)
+                free_hole = torch.mean((Tx_hole * all_flag[:, idx_hole]) ** 2) + torch.mean(
+                    (Ty_hole * all_flag[:, idx_hole]) ** 2)
+                loss_phys_free = free_bc + free_hole
+
+                # =============================================================
+                # 模块 3: NTK 自适应权重更新 (10 项 Loss 平衡)
+                # =============================================================
+                if batch_idx % update_freq == 0:
+                    shared_params = list(model.DG.parameters()) + list(model.branch_disp.parameters()) + list(
+                        model.branch_force.parameters())
+
+                    def compute_grad_norm(loss_component):
+                        optimizer.zero_grad()
+                        loss_component.backward(retain_graph=True)
+                        grads = [p.grad.flatten() for p in shared_params if p.grad is not None]
+                        if len(grads) == 0: return 1.0
+                        return torch.norm(torch.cat(grads)).item()
+
+                    # 提取数据梯度范数
+                    n_du, n_dv = compute_grad_norm(loss_data_u), compute_grad_norm(loss_data_v)
+                    n_dsx, n_dsy, n_dsxy = compute_grad_norm(loss_data_sxx), compute_grad_norm(
+                        loss_data_syy), compute_grad_norm(loss_data_sxy)
+
+                    # 提取物理梯度范数
+                    n_pde = compute_grad_norm(loss_phys_pde)
+                    n_cst = compute_grad_norm(loss_phys_const)
+                    n_ld = compute_grad_norm(loss_phys_load)
+                    n_fx = compute_grad_norm(loss_phys_fix)
+                    n_fr = compute_grad_norm(loss_phys_free)
+
+                    # 计算 10 项平均值
+                    mean_norm = (n_du + n_dv + n_dsx + n_dsy + n_dsxy + n_pde + n_cst + n_ld + n_fx + n_fr) / 10.0
+
+                    # EMA 更新 (利用倒数平衡)
+                    lam_u = alpha * lam_u + (1 - alpha) * (mean_norm / (n_du + 1e-8))
+                    lam_v = alpha * lam_v + (1 - alpha) * (mean_norm / (n_dv + 1e-8))
+                    lam_sxx = alpha * lam_sxx + (1 - alpha) * (mean_norm / (n_dsx + 1e-8))
+                    lam_syy = alpha * lam_syy + (1 - alpha) * (mean_norm / (n_dsy + 1e-8))
+                    lam_sxy = alpha * lam_sxy + (1 - alpha) * (mean_norm / (n_dsxy + 1e-8))
+
+                    lam_pde = alpha * lam_pde + (1 - alpha) * (mean_norm / (n_pde + 1e-8))
+                    lam_const = alpha * lam_const + (1 - alpha) * (mean_norm / (n_cst + 1e-8))
+                    lam_load = alpha * lam_load + (1 - alpha) * (mean_norm / (n_ld + 1e-8))
+                    lam_fix = alpha * lam_fix + (1 - alpha) * (mean_norm / (n_fx + 1e-8))
+                    lam_free = alpha * lam_free + (1 - alpha) * (mean_norm / (n_fr + 1e-8))
+
+                # =============================================================
+                # 模块 4: Total Loss & Backprop
+                # =============================================================
+                total_loss = (lam_u * loss_data_u + lam_v * loss_data_v +
+                              lam_sxx * loss_data_sxx + lam_syy * loss_data_syy + lam_sxy * loss_data_sxy +
+                              lam_pde * loss_phys_pde + lam_const * loss_phys_const +
+                              lam_load * loss_phys_load + lam_fix * loss_phys_fix + lam_free * loss_phys_free)
+
+                optimizer.zero_grad()
+                total_loss.backward()
+                optimizer.step()
+
+                # 记录 Log 数据
+                avg_loss['data_u'] += loss_data_u.item();
+                avg_loss['data_v'] += loss_data_v.item()
+                avg_loss['data_sxx'] += loss_data_sxx.item();
+                avg_loss['data_syy'] += loss_data_syy.item();
+                avg_loss['data_sxy'] += loss_data_sxy.item()
+                avg_loss['phys_pde'] += loss_phys_pde.item();
+                avg_loss['phys_const'] += loss_phys_const.item()
+                avg_loss['phys_load'] += loss_phys_load.item();
+                avg_loss['phys_fix'] += loss_phys_fix.item();
+                avg_loss['phys_free'] += loss_phys_free.item()
+                avg_loss['total'] += total_loss.item()
+
+            # ==============================
+            # 模块 5: 验证与日志打印
+            # ==============================
+            if (e + 1) % vf == 0:
+                model.eval()
+                val_err_u, val_err_v, val_err_vm = val(model, val_loader, args, device, num_nodes_list)
+
+                err_hist.append(val_err_vm)
+                div_factor = len(train_loader) * vf
+
+                print(
+                    f'\nEpoch {e + 1} - Validation L2 Error | U: {val_err_u:.6f} | V: {val_err_v:.6f} | VM: {val_err_vm:.6f}')
+                print(f'Total Dual-Driven Loss: {(avg_loss["total"] / div_factor):.6f}')
+                print('--- Data-Driven Losses & NTK Weights ---')
+                print(f'  ├─ Data U:   {(avg_loss["data_u"] / div_factor):.6f} | λ: {lam_u:.4f}')
+                print(f'  ├─ Data V:   {(avg_loss["data_v"] / div_factor):.6f} | λ: {lam_v:.4f}')
+                print(f'  ├─ Data Sxx: {(avg_loss["data_sxx"] / div_factor):.6f} | λ: {lam_sxx:.4f}')
+                print(f'  ├─ Data Syy: {(avg_loss["data_syy"] / div_factor):.6f} | λ: {lam_syy:.4f}')
+                print(f'  └─ Data Sxy: {(avg_loss["data_sxy"] / div_factor):.6f} | λ: {lam_sxy:.4f}')
+                print('--- Physics-Informed Losses & NTK Weights ---')
+                print(f'  ├─ Phys PDE: {(avg_loss["phys_pde"] / div_factor):.6f} | λ: {lam_pde:.4f}')
+                print(f'  ├─ Phys Cst: {(avg_loss["phys_const"] / div_factor):.6f} | λ: {lam_const:.4f}')
+                print(f'  ├─ Phys Lod: {(avg_loss["phys_load"] / div_factor):.6f} | λ: {lam_load:.4f}')
+                print(f'  ├─ Phys Fix: {(avg_loss["phys_fix"] / div_factor):.6f} | λ: {lam_fix:.4f}')
+                print(f'  └─ Phys Fre: {(avg_loss["phys_free"] / div_factor):.6f} | λ: {lam_free:.4f}')
+
+                if val_err_vm < min_val_err:
+                    torch.save(model.state_dict(),
+                               r'./res/saved_models/best_model_{}_{}_{}.pkl'.format(args.geo_node, args.data,
+                                                                                    args.model))
+                    min_val_err = val_err_vm
+                    print(f"  [Model Saved] 新的最佳模型已保存! 当前 VM 误差: {val_err_vm:.4f}")
+
+                # 清零累加器
+                for k in avg_loss: avg_loss[k] = 0.0
+
+    # final test
+    model.load_state_dict(
+        torch.load(r'./res/saved_models/best_model_{}_{}_{}.pkl'.format(args.geo_node, args.data, args.model),
+                   weights_only=True))
+    model.eval()
+    err_u = test(model, test_loader, args, device, num_nodes_list, params, dir='x')
+    err_v = test(model, test_loader, args, device, num_nodes_list, params, dir='y')
+    err_vm = test(model, test_loader, args, device, num_nodes_list, params, dir='vm')
+    print("\n================ 终极双驱动测试结果 ================")
+    print(f" 🌟 Disp U Relative L2 Error: {err_u:.4f}")
+    print(f" 🌟 Disp V Relative L2 Error: {err_v:.4f}")
+    print(f" 🔥 VM Stress Relative L2 Error: {err_vm:.4f}")
+    print("====================================================\n")
