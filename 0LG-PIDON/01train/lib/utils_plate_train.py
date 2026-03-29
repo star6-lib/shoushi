@@ -22,8 +22,12 @@ def val(model, loader, args, device, num_nodes_list):
     # get number of nodes of different type
     max_pde_nodes, max_bcxy_nodes, max_bcy_nodes, max_par_nodes, max_hole_nodes = num_nodes_list
 
-    mean_relative_L2 = 0
+    # === 新增：初始化 3 个独立的相对误差累加器 ===
+    mean_err_u = 0.0
+    mean_err_v = 0.0
+    mean_err_vm = 0.0
     num_eval = 0
+
     with torch.no_grad():
         for (coors, u, v, sxx, syy, sxy, flag, geo, in_disp, in_force, f_type, vm) in loader:
 
@@ -36,42 +40,48 @@ def val(model, loader, args, device, num_nodes_list):
                                      max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes + max_hole_nodes)
             if args.geo_node == 'all_domain':
                 ss_index = np.arange(0, max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes + max_hole_nodes)
-            shape_coors = coors[:, ss_index, :].float().to(device)  # (B, max_hole, 2)
-            shape_flag = flag[:, ss_index]
-            shape_flag = shape_flag.float().to(device)  # (B, max_hole)
+            shape_coor = coors[:, ss_index, :].float().to(device)
+            shape_flag = flag[:, ss_index].float().to(device)
 
-            # prepare the data
+            all_coors = coors.float().to(device)
+            all_flag = flag.float().to(device)
             in_disp = in_disp.float().to(device)
             in_force = in_force.float().to(device)
-            coors = coors.float().to(device)
-            u = u.float().to(device)
-            v = v.float().to(device)
-            vm = vm.float().to(device)
-            flag = flag.float().to(device)
 
-            # model forward
-            u_pred, v_pred, sxx_pred, syy_pred, sxy_pred = model(coors[:, :, 0], coors[:, :, 1], in_disp, in_force,
-                                                                 shape_coors, shape_flag)
+            u_gt = u.float().to(device)
+            v_gt = v.float().to(device)
+            vm_gt = vm.float().to(device)
 
-            # 计算位移的相对误差
-            err_uv = torch.sqrt(
-                torch.sum((u_pred * flag - u * flag) ** 2 + (v_pred * flag - v * flag) ** 2, -1)) / torch.sqrt(
-                torch.sum((u * flag) ** 2 + (v * flag) ** 2, -1) + 1e-8)
+            # forward pass
+            u_pred, v_pred, sxx_pred, syy_pred, sxy_pred = model(all_coors[:, :, 0], all_coors[:, :, 1], in_disp,
+                                                                 in_force, shape_coor, shape_flag)
 
-            # 计算预测 Mises 和 真实 Mises 的相对误差
-            vm_pred = torch.sqrt(sxx_pred ** 2 - sxx_pred * syy_pred + syy_pred ** 2 + 3 * sxy_pred ** 2)
-            err_vm = torch.sqrt(torch.sum((vm_pred * flag - vm * flag) ** 2, -1)) / torch.sqrt(
-                torch.sum((vm * flag) ** 2, -1) + 1e-8)
+            # 提取掩码内的有效预测值和真实值
+            u_pred_valid = u_pred * all_flag
+            v_pred_valid = v_pred * all_flag
+            u_gt_valid = u_gt * all_flag
+            v_gt_valid = v_gt * all_flag
 
-            # 综合位移和应力的误差作为最终评估指标
-            L2_relative = err_uv + err_vm
-            mean_relative_L2 += torch.sum(L2_relative).detach().cpu().item()
-            num_eval += in_disp.shape[0]
+            sxx_pred_valid = sxx_pred * all_flag
+            syy_pred_valid = syy_pred * all_flag
+            sxy_pred_valid = sxy_pred * all_flag
+            vm_gt_valid = vm_gt * all_flag
 
-        mean_relative_L2 /= num_eval
-        mean_relative_L2 = mean_relative_L2
+            # 计算预测的 Von Mises 应力
+            vm_pred_valid = torch.sqrt(
+                sxx_pred_valid ** 2 + syy_pred_valid ** 2 - sxx_pred_valid * syy_pred_valid + 3 * (sxy_pred_valid ** 2))
 
-    return mean_relative_L2
+            # 分别计算 U, V, VM 的相对 L2 误差
+            err_u = torch.norm(u_pred_valid - u_gt_valid) / torch.norm(u_gt_valid)
+            err_v = torch.norm(v_pred_valid - v_gt_valid) / torch.norm(v_gt_valid)
+            err_vm = torch.norm(vm_pred_valid - vm_gt_valid) / torch.norm(vm_gt_valid)
+
+            mean_err_u += err_u.item()
+            mean_err_v += err_v.item()
+            mean_err_vm += err_vm.item()
+            num_eval += 1
+
+        return mean_err_u / num_eval, mean_err_v / num_eval, mean_err_vm / num_eval
 
 
 # testing function
@@ -116,23 +126,23 @@ def test(model, loader, args, device, num_nodes_list, params, dir):
         # model forward
         u_pred, v_pred, sxx_pred, syy_pred, sxy_pred = model(x_test, y_test, in_disp, in_force, shape_coors, shape_flag)
 
-        if dir in ['x', 'y']:
-            L2_relative = torch.sqrt(
-                torch.sum((u_pred * flag - u * flag) ** 2 + (v_pred * flag - v * flag) ** 2, -1)) / torch.sqrt(
-                torch.sum((u * flag) ** 2 + (v * flag) ** 2, -1))
-            if dir == 'x':
-                pred = u_pred;
-                gt = u
-            if dir == 'y':
-                pred = v_pred;
-                gt = v
+        if dir == 'x':
+            L2_relative = torch.sqrt(torch.sum((u_pred * flag - u * flag) ** 2, -1)) / (
+                        torch.sqrt(torch.sum((u * flag) ** 2, -1)) + 1e-8)
+            pred = u_pred
+            gt = u
+
+        elif dir == 'y':
+            L2_relative = torch.sqrt(torch.sum((v_pred * flag - v * flag) ** 2, -1)) / (
+                        torch.sqrt(torch.sum((v * flag) ** 2, -1)) + 1e-8)
+            pred = v_pred
+            gt = v
 
         elif dir == 'vm':
-
             vm_pred = torch.sqrt(sxx_pred ** 2 - sxx_pred * syy_pred + syy_pred ** 2 + 3 * sxy_pred ** 2)
-
             pred = vm_pred
             gt = vm
+
             # Mises 专属的相对 L2 误差计算
             L2_relative = torch.sqrt(torch.sum((vm_pred * flag - vm * flag) ** 2, -1)) / torch.sqrt(
                 torch.sum((vm * flag) ** 2, -1))
@@ -506,14 +516,14 @@ def sup_train(args, config, model, device, loaders, num_nodes_list, params):
     print('learning rate:', config['train']['base_lr'])
     print('================================')
 
-    # === 新增：将 Loss 权重清晰打印到日志中 ===
-    print('--------------------------------')
-    print('Loss Weights Configuration:')
-    print('weight_load (Disp BC):', config['train']['weight_load'])
-    print('weight_fix (Fixed BC):      ', config['train']['weight_fix'])
-    print('weight_pde (Equilibrium):   ', config['train']['weight_pde'])
-    print('weight_free (Hole/Free BC): ', config['train']['weight_free'])
-    print('================================')
+    # # === 新增：将 Loss 权重清晰打印到日志中 ===
+    # print('--------------------------------')
+    # print('Loss Weights Configuration:')
+    # print('weight_load (Disp BC):', config['train']['weight_load'])
+    # print('weight_fix (Fixed BC):      ', config['train']['weight_fix'])
+    # print('weight_pde (Equilibrium):   ', config['train']['weight_pde'])
+    # print('weight_free (Hole/Free BC): ', config['train']['weight_free'])
+    # print('================================')
 
     # get train and test loader
     train_loader, val_loader, test_loader = loaders
@@ -541,59 +551,42 @@ def sup_train(args, config, model, device, loaders, num_nodes_list, params):
         model.load_state_dict(
             torch.load(r'./res/saved_models/best_model_{}_{}_{}.pkl'.format(args.geo_node, args.data, args.model),
                        weights_only=True))
+        print('>>> 成功加载已有的最佳模型！')
     except:
         print('No trained models, starting from scratch')
     model = model.to(device)
 
     # start the training
     if args.phase in ['train', 'sup_train']:
+        # 初始化最优误差为无穷大
         min_val_err = np.inf
+
+        # === 新增：打印 Epoch 0 初始模型状态，不保存模型 ===
+        model.eval()
+        init_u, init_v, init_vm = val(model, val_loader, args, device, num_nodes_list)
+        print(f"\n[Epoch 0 / Init] Validation L2 Error | U: {init_u:.6f} | V: {init_v:.6f} | VM: {init_vm:.6f}")
+        print("  └─ [保护机制] 初始模型不参与最优模型保存评估 (min_val_err 保持为 inf)\n")
+
         avg_mse_loss = 0.0
-        # === 新增：单独记录 5 个损失项 ===
         avg_loss_u = 0.0
         avg_loss_v = 0.0
         avg_loss_sxx = 0.0
         avg_loss_syy = 0.0
         avg_loss_sxy = 0.0
 
+        # === 初始化 NTK 自适应权重和滑动平均系数 ===
+        lambda_u, lambda_v, lambda_sxx, lambda_syy, lambda_sxy = 1.0, 1.0, 1.0, 1.0, 1.0
+        alpha = 0.9  # 滑动平均衰减率 (EMA)，防止权重震荡
+        update_freq = 50  # 每隔 50 个 batch 计算一次梯度权重。避免每次计算严重拖慢训练速度
+
         for e in pbar:
-            # show the performance improvement
-            if e % vf == 0:
-                model.eval()
-                err = val(model, val_loader, args, device, num_nodes_list)
-                err_hist.append(err)
-
-                # === 修复：纯数据驱动没有采样循环，直接除以 batch 数量即可 ===
-                if e > 0:
-                    train_loss_hist.append(avg_mse_loss / (vf * len(train_loader)))
-                else:
-                    train_loss_hist.append(float('nan'))  # 第 0 轮还没开始训练，用 nan 占位避免曲线跳水
-
-                print(f'\nEpoch {e} - Validation L2 Error: {err:.6f}')
-                print(f'Total MSE Loss: {(avg_mse_loss / (vf * len(train_loader))):.6f}')
-                print(f'  ├─ Loss U:   {(avg_loss_u / (vf * len(train_loader))):.6f}')
-                print(f'  ├─ Loss V:   {(avg_loss_v / (vf * len(train_loader))):.6f}')
-                print(f'  ├─ Loss Sxx: {(avg_loss_sxx / (vf * len(train_loader))):.6f}')
-                print(f'  ├─ Loss Syy: {(avg_loss_syy / (vf * len(train_loader))):.6f}')
-                print(f'  └─ Loss Sxy: {(avg_loss_sxy / (vf * len(train_loader))):.6f}')
-
-                avg_mse_loss = 0.0
-                avg_loss_u = 0.0
-                avg_loss_v = 0.0
-                avg_loss_sxx = 0.0
-                avg_loss_syy = 0.0
-                avg_loss_sxy = 0.0
-
-                if err < min_val_err:
-                    torch.save(model.state_dict(),
-                               r'./res/saved_models/best_model_{}_{}_{}.pkl'.format(args.geo_node, args.data,
-                                                                                    args.model))
-                    min_val_err = err
-
-            # train one epoch
+            # ==============================
+            # 第一阶段：训练 (Training)
+            # ==============================
             model.train()
-            # === 使用最新的 7元素解包 ===
-            for (coors, u, v, sxx, syy, sxy, flag, geo, in_disp, in_force, f_type, vm) in train_loader:
+
+            for batch_idx, (coors, u, v, sxx, syy, sxy, flag, geo, in_disp, in_force, f_type, vm) in enumerate(
+                    train_loader):
 
                 # 对于纯数据驱动，不需要采样，直接使用全部节点拟合
                 all_coors = coors.float().to(device)
@@ -603,7 +596,6 @@ def sup_train(args, config, model, device, loaders, num_nodes_list, params):
                 sxx_gt = sxx.float().to(device)
                 syy_gt = syy.float().to(device)
                 sxy_gt = sxy.float().to(device)
-                vm_gt = vm.float().to(device)
                 in_disp = in_disp.float().to(device)
                 in_force = in_force.float().to(device)
 
@@ -632,10 +624,59 @@ def sup_train(args, config, model, device, loaders, num_nodes_list, params):
                 loss_syy = mse(syy_pred * all_flag, syy_gt * all_flag)
                 loss_sxy = mse(sxy_pred * all_flag, sxy_gt * all_flag)
 
-                # 可以统一用 1.0 的权重，或者专门给应力加大一点权重（这里先平等对待）
-                total_loss = loss_u + loss_v + loss_sxx + loss_syy + loss_sxy
+                # =============================================================
+                # === NTK / 梯度范数 引导的动态权重计算核心逻辑 ===
+                # =============================================================
+                if batch_idx % update_freq == 0:
+                    # 选取网络的底层共享部分（几何特征提取器 DG）作为梯度对齐的基准锚点
+                    shared_params = list(model.DG.parameters()) + \
+                                    list(model.branch_disp.parameters()) + \
+                                    list(model.branch_force.parameters())
 
-                # === 新增：单独存储各项损失 ===
+                    # 定义辅助函数：执行单项 Loss 反向传播并获取梯度范数
+                    def compute_grad_norm(loss_component):
+                        optimizer.zero_grad()
+                        # retain_graph=True 确保后续还能继续对其他 loss 反向传播
+                        loss_component.backward(retain_graph=True)
+                        grads = [p.grad.flatten() for p in shared_params if p.grad is not None]
+                        if len(grads) == 0:
+                            return 1.0
+                        return torch.norm(torch.cat(grads)).item()
+
+                    # 分别提取 5 项 Loss 对底层的梯度大小
+                    norm_u = compute_grad_norm(loss_u)
+                    norm_v = compute_grad_norm(loss_v)
+                    norm_sxx = compute_grad_norm(loss_sxx)
+                    norm_syy = compute_grad_norm(loss_syy)
+                    norm_sxy = compute_grad_norm(loss_sxy)
+
+                    # 以各项梯度范数的平均值作为目标对齐基准
+                    mean_norm = (norm_u + norm_v + norm_sxx + norm_syy + norm_sxy) / 5.0
+
+                    # 计算目标权重 (梯度的倒数)，加 1e-8 防止除零错
+                    hat_lambda_u = mean_norm / (norm_u + 1e-8)
+                    hat_lambda_v = mean_norm / (norm_v + 1e-8)
+                    hat_lambda_sxx = mean_norm / (norm_sxx + 1e-8)
+                    hat_lambda_syy = mean_norm / (norm_syy + 1e-8)
+                    hat_lambda_sxy = mean_norm / (norm_sxy + 1e-8)
+
+                    # 使用指数滑动平均 (EMA) 平滑更新当前权重
+                    lambda_u = alpha * lambda_u + (1 - alpha) * hat_lambda_u
+                    lambda_v = alpha * lambda_v + (1 - alpha) * hat_lambda_v
+                    lambda_sxx = alpha * lambda_sxx + (1 - alpha) * hat_lambda_sxx
+                    lambda_syy = alpha * lambda_syy + (1 - alpha) * hat_lambda_syy
+                    lambda_sxy = alpha * lambda_sxy + (1 - alpha) * hat_lambda_sxy
+
+                # =============================================================
+                # === 应用动态计算出的自适应权重 ===
+                # =============================================================
+                total_loss = (lambda_u * loss_u +
+                              lambda_v * loss_v +
+                              lambda_sxx * loss_sxx +
+                              lambda_syy * loss_syy +
+                              lambda_sxy * loss_sxy)
+
+                # === 单独存储各项损失 ===
                 avg_mse_loss += total_loss.detach().cpu().item()
                 avg_loss_u += loss_u.detach().cpu().item()
                 avg_loss_v += loss_v.detach().cpu().item()
@@ -648,14 +689,56 @@ def sup_train(args, config, model, device, loaders, num_nodes_list, params):
                 total_loss.backward()
                 optimizer.step()
 
+            # ==============================
+            # 第二阶段：验证与日志打印 (Validation & Logging)
+            # ==============================
+            if (e + 1) % vf == 0:
+                model.eval()
+                val_err_u, val_err_v, val_err_vm = val(model, val_loader, args, device, num_nodes_list)
+
+                err_hist.append(val_err_vm)
+
+                # 记录训练误差
+                div_factor = len(train_loader) * vf
+                train_loss_hist.append(avg_mse_loss / div_factor)
+
+                # 打印分离的验证误差
+                print(
+                    f'\nEpoch {e + 1} - Validation L2 Error | U: {val_err_u:.6f} | V: {val_err_v:.6f} | VM: {val_err_vm:.6f}')
+                print(f'Total MSE Loss: {(avg_mse_loss / div_factor):.6f}')
+                # 打印各损失项的同时，展示当前的 NTK 权重大小
+                print(f'  ├─ Loss U:   {(avg_loss_u / div_factor):.6f}  |  Weight(λ_u):   {lambda_u:.4f}')
+                print(f'  ├─ Loss V:   {(avg_loss_v / div_factor):.6f}  |  Weight(λ_v):   {lambda_v:.4f}')
+                print(f'  ├─ Loss Sxx: {(avg_loss_sxx / div_factor):.6f}  |  Weight(λ_sxx): {lambda_sxx:.4f}')
+                print(f'  ├─ Loss Syy: {(avg_loss_syy / div_factor):.6f}  |  Weight(λ_syy): {lambda_syy:.4f}')
+                print(f'  └─ Loss Sxy: {(avg_loss_sxy / div_factor):.6f}  |  Weight(λ_sxy): {lambda_sxy:.4f}')
+
+                # 仅使用 VM 应力误差作为判定模型好坏的标准
+                if val_err_vm < min_val_err:
+                    torch.save(model.state_dict(),
+                               r'./res/saved_models/best_model_{}_{}_{}.pkl'.format(args.geo_node, args.data,
+                                                                                    args.model))
+                    min_val_err = val_err_vm
+                    print(f"  [Model Saved] 新的最佳模型已保存! 当前 VM 误差: {val_err_vm:.4f}")
+
+                # 清零累加器，准备下一个周期的统计
+                avg_mse_loss = 0.0
+                avg_loss_u = 0.0
+                avg_loss_v = 0.0
+                avg_loss_sxx = 0.0
+                avg_loss_syy = 0.0
+                avg_loss_sxy = 0.0
+
     # final test (包含 vm 绘图)
     model.load_state_dict(
         torch.load(r'./res/saved_models/best_model_{}_{}_{}.pkl'.format(args.geo_node, args.data, args.model),
                    weights_only=True))
     model.eval()
-    err = test(model, test_loader, args, device, num_nodes_list, params, dir='x')
-    _ = test(model, test_loader, args, device, num_nodes_list, params, dir='y')
-    _ = test(model, test_loader, args, device, num_nodes_list, params, dir='vm')
-    print('================================')
-    print('Best L2 relative error on test loader:', err)
-
+    err_u = test(model, test_loader, args, device, num_nodes_list, params, dir='x')
+    err_v = test(model, test_loader, args, device, num_nodes_list, params, dir='y')
+    err_vm = test(model, test_loader, args, device, num_nodes_list, params, dir='vm')
+    print("\n================ 终极测试结果 (基于最佳 VM 模型) ================")
+    print(f" 🌟 Disp U (X方向位移) Relative L2 Error: {err_u:.4f}")
+    print(f" 🌟 Disp V (Y方向位移) Relative L2 Error: {err_v:.4f}")
+    print(f" 🔥 Von Mises Stress   Relative L2 Error: {err_vm:.4f}")
+    print("=================================================================\n")
