@@ -5,19 +5,20 @@ model:
 
 train:
   epochs: 200
-  coor_sampling_size: 500
+  coor_sampling_size: 2000
   batchsize: 10
   coor_sampling_freq: 3
-  base_lr: 0.001
+  base_lr: 0.0001
   visual_freq: 2
+
   weight_load: 100
   weight_pde: 1
   weight_fix: 100
   weight_free: 10
-  weight_ce: 1
+  weight_const: 1
 
   # learning rate decay settings
-  lr_decay_type: 'step'  # 'step', 'exp', 'cosine', 'plateau'
+  lr_decay_type: 'plateau'  # 'none', 'exp', 'cosine', 'plateau'
   lr_decay_step: 50      # for step decay: decay every N epochs
   lr_decay_rate: 0.5    # for step decay: multiply lr by this factor
   lr_decay_gamma: 0.95  # for exponential decay: multiply lr by gamma each epoch

@@ -12,7 +12,7 @@ import os
 
 # define arguements
 parser = argparse.ArgumentParser(description='command setting')
-parser.add_argument('--phase', type=str, default='sup_train')
+parser.add_argument('--phase', type=str, default='plus_train')
 parser.add_argument('--data', type=str, default='plate_stress_DG')
 parser.add_argument('--model', type=str, default='GANO')
 parser.add_argument('--geo_node', type=str, default='vary_bound', choices=['vary_bound', 'all_bound', 'all_domain'])

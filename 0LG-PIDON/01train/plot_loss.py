@@ -1,133 +1,134 @@
-import re
 import matplotlib.pyplot as plt
 import numpy as np
+import re
+import matplotlib.ticker as ticker
+import os
 
+# 1. 解析日志文件
+# 解决报错的关键：加入 encoding='utf-8'
+log_file = 'output-58547971.log'
 
-def parse_log_file(file_path):
-    """从 log 文件中提取 loss 和 error 数据"""
-    data = {
-        'epoch_idx': [],
-        'error': [],
-        'pde': [],
-        'ce': [],
-        'fix': [],
-        'free': [],
-        'load': []
-    }
+epochs = []
+val_l2_u, val_l2_v, val_l2_vm = [], [], []
+total_loss = []
+loss_u, loss_v, loss_sxx, loss_syy, loss_sxy = [], [], [], [], []
+w_u, w_v, w_sxx, w_syy, w_sxy = [], [], [], [], []
 
-    # 正则表达式匹配模式
-    regex_err = re.compile(r'Current epoch error:\s+([0-9\.\-eE]+|inf)')
-    regex_pde = re.compile(r'current epochs pde loss:\s+([0-9\.\-eE]+|inf)')
-    regex_ce = re.compile(r'CE \(Hooke\):\s+([0-9\.\-eE]+|inf)')
-    regex_fix = re.compile(r'fix bc loss:\s+([0-9\.\-eE]+|inf)')
-    regex_free = re.compile(r'free bc loss:\s+([0-9\.\-eE]+|inf)')
-    regex_load = re.compile(r'load bc loss:\s+([0-9\.\-eE]+|inf)')
+print(f"Reading {log_file} with utf-8 encoding...")
 
-    step = 1
+with open(log_file, 'r', encoding='utf-8') as f:
+    lines = f.readlines()
 
-    with open(file_path, 'r', encoding='utf-8') as f:
-        # 为了应对分行打印，我们按行读取并暂存
-        current_step_data = {}
-        for line in f:
-            if match := regex_err.search(line):
-                current_step_data['error'] = float(match.group(1)) if match.group(1) != 'inf' else np.nan
-            elif match := regex_pde.search(line):
-                current_step_data['pde'] = float(match.group(1)) if match.group(1) != 'inf' else np.nan
-            elif match := regex_ce.search(line):
-                current_step_data['ce'] = float(match.group(1)) if match.group(1) != 'inf' else np.nan
-            elif match := regex_fix.search(line):
-                current_step_data['fix'] = float(match.group(1)) if match.group(1) != 'inf' else np.nan
-            elif match := regex_free.search(line):
-                current_step_data['free'] = float(match.group(1)) if match.group(1) != 'inf' else np.nan
-            elif match := regex_load.search(line):
-                current_step_data['load'] = float(match.group(1)) if match.group(1) != 'inf' else np.nan
+for i, line in enumerate(lines):
+    # 解析 Epoch 和 验证集误差
+    if line.startswith('Epoch ') and 'Validation L2 Error' in line:
+        match = re.search(r'Epoch (\d+) - Validation L2 Error \| U: ([\d.]+) \| V: ([\d.]+) \| VM: ([\d.]+)', line)
+        if match:
+            epochs.append(int(match.group(1)))
+            val_l2_u.append(float(match.group(2)))
+            val_l2_v.append(float(match.group(3)))
+            val_l2_vm.append(float(match.group(4)))
 
-                # 当 load 读取到时，说明这一轮的数据收集完毕 (根据您的日志格式)
-                if all(k in current_step_data for k in ['error', 'pde', 'ce', 'fix', 'free', 'load']):
-                    data['epoch_idx'].append(step)
-                    for k in ['error', 'pde', 'ce', 'fix', 'free', 'load']:
-                        data[k].append(current_step_data[k])
-                    current_step_data = {}
-                    step += 1
+    # 解析总 Loss
+    elif 'Total MSE Loss:' in line:
+        match = re.search(r'Total MSE Loss:\s+([\d.]+)', line)
+        if match: total_loss.append(float(match.group(1)))
 
-    return data
+    # 解析各项分 Loss 和 NTK 权重
+    elif '├─ Loss U:' in line:
+        match = re.search(r'Loss U:\s+([\d.]+)\s+\|\s+Weight\(λ_u\):\s+([\d.]+)', line)
+        if match:
+            loss_u.append(float(match.group(1)))
+            w_u.append(float(match.group(2)))
 
+    elif '├─ Loss V:' in line:
+        match = re.search(r'Loss V:\s+([\d.]+)\s+\|\s+Weight\(λ_v\):\s+([\d.]+)', line)
+        if match:
+            loss_v.append(float(match.group(1)))
+            w_v.append(float(match.group(2)))
 
-def plot_academic_curves(data, save_prefix='training'):
-    """绘制学术级的高质量图表"""
+    elif '├─ Loss Sxx:' in line:
+        match = re.search(r'Loss Sxx:\s+([\d.]+)\s+\|\s+Weight\(λ_sxx\):\s+([\d.]+)', line)
+        if match:
+            loss_sxx.append(float(match.group(1)))
+            w_sxx.append(float(match.group(2)))
 
-    # 学术论文全局字体与样式设置
-    plt.rcParams.update({
-        'font.family': 'serif',
-        'font.size': 14,
-        'axes.linewidth': 1.5,
-        'xtick.major.width': 1.5,
-        'ytick.major.width': 1.5,
-        'legend.fontsize': 12,
-        'legend.framealpha': 0.9,
-    })
+    elif '├─ Loss Syy:' in line:
+        match = re.search(r'Loss Syy:\s+([\d.]+)\s+\|\s+Weight\(λ_syy\):\s+([\d.]+)', line)
+        if match:
+            loss_syy.append(float(match.group(1)))
+            w_syy.append(float(match.group(2)))
 
-    epochs = np.array(data['epoch_idx']) * 2  # 假设 visual_freq = 2
+    elif '└─ Loss Sxy:' in line:
+        match = re.search(r'Loss Sxy:\s+([\d.]+)\s+\|\s+Weight\(λ_sxy\):\s+([\d.]+)', line)
+        if match:
+            loss_sxy.append(float(match.group(1)))
+            w_sxy.append(float(match.group(2)))
 
-    # ==========================================
-    # 图 1: 物理损失函数 (Log Scale)
-    # ==========================================
-    fig1, ax1 = plt.subplots(figsize=(8, 6))
+print(f"Successfully parsed {len(epochs)} epochs.")
 
-    ax1.plot(epochs, data['load'], label=r'$\mathcal{L}_{load}$ (Force BC)', color='#d62728', linewidth=2.5, alpha=0.85)
-    ax1.plot(epochs, data['fix'], label=r'$\mathcal{L}_{fix}$ (Fixed BC)', color='#ff7f0e', linewidth=2.5, alpha=0.85)
-    ax1.plot(epochs, data['free'], label=r'$\mathcal{L}_{free}$ (Hole & Free BC)', color='#2ca02c', linewidth=2.5,
-             alpha=0.85)
-    ax1.plot(epochs, data['pde'], label=r'$\mathcal{L}_{pde}$ (Equilibrium)', color='#1f77b4', linewidth=2.5,
-             alpha=0.85)
-    ax1.plot(epochs, data['ce'], label=r'$\mathcal{L}_{ce}$ (Constitutive)', color='#9467bd', linewidth=2.5, alpha=0.85)
+# 防止有些列表长度不一致报错，截断到最短长度
+min_len = min(len(epochs), len(total_loss), len(loss_u))
+epochs = epochs[:min_len]
+total_loss = total_loss[:min_len]
+val_l2_vm = val_l2_vm[:min_len]
+loss_u, loss_v = loss_u[:min_len], loss_v[:min_len]
+loss_sxx, loss_syy, loss_sxy = loss_sxx[:min_len], loss_syy[:min_len], loss_sxy[:min_len]
+w_u, w_sxx = w_u[:min_len], w_sxx[:min_len]
+w_syy, w_sxy = w_syy[:min_len], w_sxy[:min_len]
 
-    ax1.set_yscale('log')
-    ax1.set_xlabel('Epochs', fontweight='bold')
-    ax1.set_ylabel('Loss Value (Log Scale)', fontweight='bold')
-    ax1.set_title('Convergence of Physical Constraints', fontweight='bold', pad=15)
+# ================= 论文级可视化配置 =================
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Times New Roman']
+plt.rcParams['font.size'] = 11
+plt.rcParams['mathtext.fontset'] = 'stix'
 
-    # 开启网格线 (主刻度和次刻度)
-    ax1.grid(True, which="both", ls="--", alpha=0.5)
-    ax1.legend(loc='upper right', edgecolor='black')
+fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
 
-    plt.tight_layout()
-    fig1.savefig(f'{save_prefix}_loss_components.png', dpi=300, bbox_inches='tight')
-    fig1.savefig(f'{save_prefix}_loss_components.pdf', format='pdf', bbox_inches='tight')  # 投递顶会常用的矢量图格式
-    plt.close(fig1)
+# --- 子图 1: Total Loss 与 Validation VM Error ---
+ax1.plot(epochs, total_loss, 'b-', linewidth=2, label='Total MSE Loss')
+ax1.set_ylabel('Total MSE Loss', color='b', fontweight='bold')
+ax1.tick_params(axis='y', labelcolor='b')
+ax1.set_yscale('log')
+ax1.grid(True, linestyle='--', alpha=0.6)
 
-    # ==========================================
-    # 图 2: 相对误差 (Relative L2 Error)
-    # ==========================================
-    fig2, ax2 = plt.subplots(figsize=(8, 6))
+ax1_twin = ax1.twinx()
+ax1_twin.plot(epochs, val_l2_vm, 'r--', linewidth=2, label='Val Error (Von Mises)')
+ax1_twin.set_ylabel('Relative $L_2$ Error', color='r', fontweight='bold')
+ax1_twin.tick_params(axis='y', labelcolor='r')
 
-    ax2.plot(epochs, data['error'], label='Relative $L_2$ Error', color='#17becf', linewidth=3.0)
+lines1, labels1 = ax1.get_legend_handles_labels()
+lines2, labels2 = ax1_twin.get_legend_handles_labels()
+ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')
+ax1.set_title('(a) Overall Training and Validation Performance', loc='left', fontsize=12, fontweight='bold')
 
-    ax2.set_xlabel('Epochs', fontweight='bold')
-    ax2.set_ylabel('Relative Error', fontweight='bold')
-    ax2.set_title('Model Prediction Error over Training', fontweight='bold', pad=15)
+# --- 子图 2: 分项 Loss (Log 坐标) ---
+ax2.plot(epochs, loss_u, linestyle='-', color='#1f77b4', label=r'$\mathcal{L}_U$')
+ax2.plot(epochs, loss_v, linestyle='-', color='#ff7f0e', label=r'$\mathcal{L}_V$')
+ax2.plot(epochs, loss_sxx, linestyle='-', color='#2ca02c', label=r'$\mathcal{L}_{\sigma_{xx}}$')
+ax2.plot(epochs, loss_syy, linestyle='-', color='#d62728', label=r'$\mathcal{L}_{\sigma_{yy}}$')
+ax2.plot(epochs, loss_sxy, linestyle='-', color='#9467bd', label=r'$\mathcal{L}_{\sigma_{xy}}$')
+ax2.set_ylabel('Component Loss (Log)', fontweight='bold')
+ax2.set_yscale('log')
+ax2.grid(True, linestyle='--', alpha=0.6)
+ax2.legend(ncol=5, loc='upper center', bbox_to_anchor=(0.5, 1.0))
+ax2.set_title('(b) Component MSE Losses', loc='left', fontsize=12, fontweight='bold')
 
-    ax2.grid(True, ls="--", alpha=0.7)
-    ax2.legend(loc='upper right', edgecolor='black')
+# --- 子图 3: NTK 权重变化 ---
+ax3.plot(epochs, w_u, linestyle='-', color='#1f77b4', label=r'$\lambda_U$')
+ax3.plot(epochs, w_sxx, linestyle='-', color='#2ca02c', label=r'$\lambda_{\sigma_{xx}}$')
+ax3.plot(epochs, w_syy, linestyle='-', color='#d62728', label=r'$\lambda_{\sigma_{yy}}$')
+ax3.plot(epochs, w_sxy, linestyle='-', color='#9467bd', label=r'$\lambda_{\sigma_{xy}}$')
+ax3.set_xlabel('Epochs', fontweight='bold', fontsize=12)
+ax3.set_ylabel('NTK Weights $\lambda$', fontweight='bold')
+ax3.set_yscale('log')  # 权重差异太大，使用对数坐标
+ax3.grid(True, linestyle='--', alpha=0.6)
+ax3.legend(ncol=4, loc='upper center')
+ax3.set_title('(c) Evolution of Adaptive NTK Weights', loc='left', fontsize=12, fontweight='bold')
 
-    plt.tight_layout()
-    fig2.savefig(f'{save_prefix}_l2_error.png', dpi=300, bbox_inches='tight')
-    fig2.savefig(f'{save_prefix}_l2_error.pdf', format='pdf', bbox_inches='tight')
-    plt.close(fig2)
+plt.tight_layout()
 
-    print(f"✅ 图表已成功生成！已保存为 {save_prefix}_loss_components.png/pdf 和 {save_prefix}_l2_error.png/pdf")
-
-
-if __name__ == "__main__":
-    # 请将这里的 'output.log' 替换为您真实的日志文件名
-    LOG_FILE_PATH = 'output-8456737.log'
-
-    try:
-        parsed_data = parse_log_file(LOG_FILE_PATH)
-        if len(parsed_data['epoch_idx']) == 0:
-            print("警告：未能从日志中提取到完整数据，请检查日志格式是否匹配。")
-        else:
-            print(f"成功提取 {len(parsed_data['epoch_idx'])} 个评估步的数据。开始绘图...")
-            plot_academic_curves(parsed_data, save_prefix='LA_PIDON')
-    except Exception as e:
-        print(f"发生错误: {e}")
+save_path = 'training_analysis.pdf'
+plt.savefig(save_path, dpi=300, bbox_inches='tight')
+print(f"Plot saved successfully to {save_path}")
+plt.show()

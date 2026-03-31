@@ -144,8 +144,8 @@ def test(model, loader, args, device, num_nodes_list, params, dir):
             gt = vm
 
             # Mises 专属的相对 L2 误差计算
-            L2_relative = torch.sqrt(torch.sum((vm_pred * flag - vm * flag) ** 2, -1)) / torch.sqrt(
-                torch.sum((vm * flag) ** 2, -1))
+            L2_relative = torch.sqrt(torch.sum((vm_pred * flag - vm * flag) ** 2, -1)) / (torch.sqrt(
+                torch.sum((vm * flag) ** 2, -1)) + 1e-8)
 
         # find the max and min error sample in this batch
         max_err, max_err_idx = torch.topk(L2_relative, 1)
@@ -274,6 +274,45 @@ def get_geometry_embeddings(model, loader, args, device, num_nodes_list):
 
     return all_geo_embeddings
 
+# ==========================================================
+# 新增：定义统一的学习率调度器获取函数
+# ==========================================================
+def get_scheduler(optimizer, config):
+    """根据 yaml 配置动态生成学习率衰减机制"""
+    decay_type = config['train'].get('lr_decay_type', 'none')
+
+    if decay_type == 'step':
+        # 阶梯衰减：每隔 step_size 个 epoch，学习率乘以 gamma
+        return optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=config['train'].get('lr_decay_step', 50),
+            gamma=config['train'].get('lr_decay_rate', 0.5)
+        )
+    elif decay_type == 'exp':
+        # 指数衰减：每个 epoch 学习率乘以 gamma
+        return optim.lr_scheduler.ExponentialLR(
+            optimizer,
+            gamma=config['train'].get('lr_decay_gamma', 0.95)
+        )
+    elif decay_type == 'cosine':
+        # 余弦退火：平滑下降到最小学习率
+        return optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=config['train']['epochs'],
+            eta_min=float(config['train'].get('lr_min', 1e-6))
+        )
+    elif decay_type == 'plateau':
+        # 自适应衰减：当验证集误差停止下降 patience 个次后，自动降低学习率 (极其推荐！)
+        return optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=config['train'].get('lr_decay_rate', 0.5),
+            patience=config['train'].get('lr_patience', 10),
+            min_lr=float(config['train'].get('lr_min', 1e-6))
+        )
+    else:
+        # 设为 'none' 或未定义时，使用固定学习率
+        return None
 
 # define the training function
 def train(args, config, model, device, loaders, num_nodes_list, params):
@@ -306,6 +345,8 @@ def train(args, config, model, device, loaders, num_nodes_list, params):
     # define optimizer and loss
     mse = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=config['train']['base_lr'])
+    # === 新增：初始化学习率调度器 ===
+    scheduler = get_scheduler(optimizer, config)
 
     # visual frequency
     vf = config['train']['visual_freq']
@@ -491,6 +532,9 @@ def train(args, config, model, device, loaders, num_nodes_list, params):
 
                     # clear cuda
                     # torch.cuda.empty_cache()
+            # === 新增：其它类型调度器在每个 Epoch 结束时自动步进衰减 ===
+            if scheduler is not None and not isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step()
 
     # final test
     model.load_state_dict(
@@ -538,6 +582,8 @@ def sup_train(args, config, model, device, loaders, num_nodes_list, params):
     # define optimizer and loss
     mse = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=config['train']['base_lr'])
+    # === 新增：初始化学习率调度器 ===
+    scheduler = get_scheduler(optimizer, config)
 
     # visual frequency
     vf = config['train']['visual_freq']
@@ -696,6 +742,12 @@ def sup_train(args, config, model, device, loaders, num_nodes_list, params):
                 model.eval()
                 val_err_u, val_err_v, val_err_vm = val(model, val_loader, args, device, num_nodes_list)
 
+                if scheduler is not None and isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(val_err_vm)
+
+                # === 新增 2：获取当前最新的学习率 ===
+                current_lr = optimizer.param_groups[0]['lr']
+
                 err_hist.append(val_err_vm)
 
                 # 记录训练误差
@@ -703,8 +755,7 @@ def sup_train(args, config, model, device, loaders, num_nodes_list, params):
                 train_loss_hist.append(avg_mse_loss / div_factor)
 
                 # 打印分离的验证误差
-                print(
-                    f'\nEpoch {e + 1} - Validation L2 Error | U: {val_err_u:.6f} | V: {val_err_v:.6f} | VM: {val_err_vm:.6f}')
+                print(f'\nEpoch {e + 1} - LR: {current_lr:.2e} | Validation L2 Error | U: {val_err_u:.6f} | V: {val_err_v:.6f} | VM: {val_err_vm:.6f}')
                 print(f'Total MSE Loss: {(avg_mse_loss / div_factor):.6f}')
                 # 打印各损失项的同时，展示当前的 NTK 权重大小
                 print(f'  ├─ Loss U:   {(avg_loss_u / div_factor):.6f}  |  Weight(λ_u):   {lambda_u:.4f}')
@@ -728,6 +779,9 @@ def sup_train(args, config, model, device, loaders, num_nodes_list, params):
                 avg_loss_sxx = 0.0
                 avg_loss_syy = 0.0
                 avg_loss_sxy = 0.0
+            # === 新增：其它类型调度器在每个 Epoch 结束时自动步进衰减 ===
+            if scheduler is not None and not isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step()
 
     # final test (包含 vm 绘图)
     model.load_state_dict(
@@ -770,6 +824,8 @@ def plus_train(args, config, model, device, loaders, num_nodes_list, params):
     # define optimizer and loss
     mse = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=config['train']['base_lr'])
+    # === 新增：初始化学习率调度器 ===
+    scheduler = get_scheduler(optimizer, config)
 
     # visual frequency
     vf = config['train']['visual_freq']
@@ -990,12 +1046,16 @@ def plus_train(args, config, model, device, loaders, num_nodes_list, params):
             if (e + 1) % vf == 0:
                 model.eval()
                 val_err_u, val_err_v, val_err_vm = val(model, val_loader, args, device, num_nodes_list)
+                if scheduler is not None and isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(val_err_vm)
+
+                # === 新增 2：获取当前最新的学习率 ===
+                current_lr = optimizer.param_groups[0]['lr']
 
                 err_hist.append(val_err_vm)
                 div_factor = len(train_loader) * vf
 
-                print(
-                    f'\nEpoch {e + 1} - Validation L2 Error | U: {val_err_u:.6f} | V: {val_err_v:.6f} | VM: {val_err_vm:.6f}')
+                print(f'\nEpoch {e + 1} - LR: {current_lr:.2e} | Validation L2 Error | U: {val_err_u:.6f} | V: {val_err_v:.6f} | VM: {val_err_vm:.6f}')
                 print(f'Total Dual-Driven Loss: {(avg_loss["total"] / div_factor):.6f}')
                 print('--- Data-Driven Losses & NTK Weights ---')
                 print(f'  ├─ Data U:   {(avg_loss["data_u"] / div_factor):.6f} | λ: {lam_u:.4f}')
@@ -1019,6 +1079,9 @@ def plus_train(args, config, model, device, loaders, num_nodes_list, params):
 
                 # 清零累加器
                 for k in avg_loss: avg_loss[k] = 0.0
+            # === 新增：其它类型调度器在每个 Epoch 结束时自动步进衰减 ===
+            if scheduler is not None and not isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step()
 
     # final test
     model.load_state_dict(
